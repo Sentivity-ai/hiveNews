@@ -6,23 +6,16 @@ import datetime
 import pandas as pd
 import joblib
 import scipy.sparse as sp
-import gradio as gr
 from sklearn.cluster import KMeans
-import requests
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 import traceback
 import asyncio
-import aiohttp
 from typing import List, Tuple
+from flask import Flask, request, jsonify
 
 
 """**Collect all Reddit data from past week**"""
-max_vids = 5
-cmv = 5
 openai_api_key = os.getenv('open_api')
-yt_api=os.getenv('yt_api')
 nlp = spacy.load("en_core_web_sm")
 ENTITY_LABELS_TO_KEEP = {"PERSON", "ORG", "GPE", "LOC", "EVENT", "PRODUCT", "WORK_OF_ART"}
 
@@ -138,114 +131,6 @@ def fetch_posts(query, subreddit_name="all", limit=None):
     except Exception as e:
         print(f"Reddit fetch error: {e}")
         return []
-
-
-
-lock = threading.Lock()
-
-def fetch_comments_for_video(video_id, published, api_key, comments_per_video):
-    url = "https://www.googleapis.com/youtube/v3/commentThreads"
-    params = {
-        "part": "snippet",
-        "videoId": video_id,
-        "maxResults": comments_per_video,
-        "textFormat": "plainText",
-        "key": api_key
-    }
-
-    try:
-        items = requests.get(url, params=params).json().get("items", [])
-    except requests.exceptions.RequestException:
-        return []
-
-    rows = []
-    for c in items:
-        text = c["snippet"]["topLevelComment"]["snippet"]["textDisplay"]
-        rows.append({"text": text, "date": published})
-
-    return rows
-
-
-def process_hashtag(tag, api_key, max_videos, comments_per_video, seen):
-    local_rows = []
-
-    query = tag.lstrip("#")
-    url = "https://www.googleapis.com/youtube/v3/search"
-    params = {
-        "part": "snippet",
-        "q": f"#{query}",
-        "type": "video",
-        "maxResults": max_videos,
-        "key": api_key
-    }
-
-    try:
-        results = requests.get(url, params=params).json().get("items", [])
-    except requests.exceptions.RequestException:
-        return []
-
-    futures = []
-
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        for item in results:
-            vid = item.get("id", {})
-            if vid.get("kind") != "youtube#video":
-                continue
-
-            video_id = vid.get("videoId")
-            if not video_id:
-                continue
-
-            with lock:
-                if video_id in seen:
-                    continue
-                seen.add(video_id)
-
-            published = item["snippet"]["publishedAt"]
-
-            futures.append(
-                executor.submit(
-                    fetch_comments_for_video,
-                    video_id,
-                    published,
-                    api_key,
-                    comments_per_video
-                )
-            )
-
-        for f in as_completed(futures):
-            local_rows.extend(f.result())
-
-    return local_rows
-
-def get_youtube_comments_for_hashtags(
-    hashtags, max_videos=max_vids, comments_per_video=cmv
-):
-    api_key = yt_api
-    seen = set()
-    rows = []
-
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = [
-            executor.submit(
-                process_hashtag,
-                tag,
-                api_key,
-                max_videos,
-                comments_per_video,
-                seen
-            )
-            for tag in hashtags
-        ]
-
-        for f in as_completed(futures):
-            rows.extend(f.result())
-
-    if not rows:
-        return pd.DataFrame(columns=["text", "date"])
-
-    print(f"{len(rows)} youtube posts collected")
-    return pd.DataFrame(rows)
 
 
 def simple_preprocess(texts):
@@ -373,7 +258,7 @@ async def generate_summary_async(query, cluster_texts, is_question):
         response = await loop.run_in_executor(
             None,
             lambda: client.responses.create(
-                model="gpt-5.1",
+                model="gpt-4o",
                 input=prompt
             )
         )
@@ -412,7 +297,7 @@ async def generate_header_async(query, cluster_texts):
         response = await loop.run_in_executor(
             None,
             lambda: client.responses.create(
-                model="gpt-5.1",
+                model="gpt-4o",
                 input=prompt
             )
         )
@@ -455,7 +340,7 @@ async def generate_final_report_async(query: str, full_summary_report: str, top_
         response = await loop.run_in_executor(
             None,
             lambda: client.responses.create(
-                model="gpt-5.1",
+                model="gpt-4o",
                 input=prompt
             )
         )
@@ -531,26 +416,22 @@ def get_word_frequencies(texts_list, stopwords=None):
     return Counter(words)
 
 
-def summarize_clusters_wrapper(query, context, pop_choice, no_pop_filter, context_question):
+def summarize_clusters_wrapper(query, context, context_question):
     """Wrapper that runs async operations"""
     try:
         global NO_POP_FILTER
-        NO_POP_FILTER = bool(no_pop_filter)
+        NO_POP_FILTER = True
 
         query = (query or "").strip()
         context = (context or "").strip()
         context_question = (context_question or "").strip()
 
         if not query:
-            return "Please enter a word or phrase to search."
+            return {"error": "Please enter a word or phrase to search."}
 
         # --- 1) DETERMINE SEARCH TERMS ---
         context_as_list = [context]
         extracted_nouns = top_spacy_entities(context_as_list)
-
-        youtube_search_terms = set(extracted_nouns)
-        youtube_search_terms.add(query)
-        youtube_search_terms = list(youtube_search_terms)
 
         # --- 2) REDDIT DATA FETCHING ---
         all_posts = []
@@ -562,7 +443,7 @@ def summarize_clusters_wrapper(query, context, pop_choice, no_pop_filter, contex
             print(f"[WARN] Reddit fetch failed: {e}")
 
         if not all_posts:
-            return f"No Reddit posts found for query: '{query}'."
+            return {"error": f"No Reddit posts found for query: '{query}'."}
 
         posts_df = pd.DataFrame(all_posts)
         posts_df = posts_df.drop_duplicates(subset="post_id")
@@ -575,20 +456,16 @@ def summarize_clusters_wrapper(query, context, pop_choice, no_pop_filter, contex
             posts_df["title"].fillna("") + " " + posts_df["content"].fillna("")
         ).tolist()
 
-        # --- 3) YOUTUBE DATA FETCHING ---
-        youtube_df = get_youtube_comments_for_hashtags(youtube_search_terms)
-        youtube_texts = youtube_df["text"].tolist()
-
         # --- 4) COMBINE ---
-        texts = reddit_texts + youtube_texts
+        texts = reddit_texts
         if not texts:
-            return f"No social media texts found for query: '{query}'."
+            return {"error": f"No social media texts found for query: '{query}'."}
 
         # --- FILTER ---
-        filtered_texts = filter_texts_for_trend(texts, pop_choice)
+        filtered_texts = filter_texts_for_trend(texts, "Pop culture")
 
         if not filtered_texts:
-            return "No texts matched the selected content filter."
+            return {"error": "No texts matched the selected content filter."}
         
         # OPTIMIZED: Deduplicate exact matches before embedding
         filtered_texts = list(dict.fromkeys(filtered_texts))
@@ -666,83 +543,51 @@ def summarize_clusters_wrapper(query, context, pop_choice, no_pop_filter, contex
             )
         finally:
             loop.close()
-        
-        final_output = f"""
-## 🎯 Executive Report: {query.title()}
-{final_executive_report}
----
-## Detailed Trend Briefings
-{full_summary_report}
-"""
 
-        return final_output
+        return {
+            "query": query,
+            "context": context,
+            "context_question": context_question,
+            "post_count": len(filtered_texts),
+            "cluster_count": len(proper_counts),
+            "executive_report": final_executive_report,
+            "detailed_briefings": full_summary_report,
+        }
 
     except Exception as e:
-        error_msg = f"""
-### Error occurred
-{str(e)}
-Traceback:
-{traceback.format_exc()}
-"""
+        error_msg = {
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
         print(error_msg)
         return error_msg
 
 
 # =========================
-# Gradio UI
+# Flask API
 # =========================
-with gr.Blocks(theme=gr.themes.Soft()) as demo:
-    gr.Markdown("## 📰 Hive News Trend Report Generator")
+app = Flask(__name__)
 
-    with gr.Row():
-        query_input = gr.Textbox(
-            label="1. Primary Topic/Search Phrase",
-            placeholder="e.g. Tesla stock, Taylor Swift tour, RTX 5090",
-            scale=1
-        )
-        context_input = gr.Textbox(
-            label="2. Context (Optional Search Expansion)",
-            placeholder="e.g. Elon Musk, Gigafactory, Cybertruck (for Tesla) — Used for broader search coverage.",
-            scale=1
-        )
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
 
-    gr.Markdown("""
-    ### 3. Content Filtering
-    **Default Recommended:** To capture the broadest view, the **'No pop-culture filter'** box below should remain checked. Only use the content filter for highly focused or more thorough analysis.
-    """)
+@app.route("/hive", methods=["POST"])
+def hive():
+    body = request.get_json(force=True, silent=True) or {}
+    query = body.get("query", "").strip()
+    context = body.get("context", "").strip()
+    context_question = body.get("context_question", "").strip()
 
-    with gr.Row():
-        pop_toggle = gr.Dropdown(
-            label="Filter Type (Only used if 'No pop-culture filter' is unchecked)",
-            choices=["Pop culture", "Not pop culture"],
-            value="Pop culture",
-            scale=1
-        )
-        no_pop_filter_cb = gr.Checkbox(
-            label="No pop-culture filter (Recommended for broadest data)",
-            value=True,
-            scale=1
-        )
+    if not query:
+        return jsonify({"error": "query field is required"}), 400
 
-    with gr.Row():
-        context_query = gr.Textbox(
-            label = "Query (Optional Search)",
-            placeholder = "Do people think Teslas are too expensive?",
-            scale=1
-        )
+    result = summarize_clusters_wrapper(query, context, context_question)
+    if "error" in result:
+        return jsonify(result), 422
+    return jsonify(result), 200
 
-    analyze_btn = gr.Button("Cluster + Generate Report", variant="primary")
-    output_md = gr.Markdown()
-
-    analyze_btn.click(
-        fn=summarize_clusters_wrapper,
-        inputs=[query_input, context_input, pop_toggle, no_pop_filter_cb, context_query],
-        outputs=output_md
-    )
 
 if __name__ == "__main__":
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        ssr_mode=False
-)
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
