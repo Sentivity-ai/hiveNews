@@ -572,17 +572,29 @@ app = Flask(__name__)
 def health():
     return jsonify({"status": "ok"})
 
-@app.route("/hive", methods=["POST"])
+@app.route("/hive", methods=["GET", "POST"])
 def hive():
-    body = request.get_json(force=True, silent=True) or {}
-    query = body.get("query", "").strip()
-    context = body.get("context", "").strip()
-    context_question = body.get("context_question", "").strip()
+    if request.method == "GET":
+        query = request.args.get("query", "").strip()
+        context = request.args.get("context", "").strip()
+        context_question = request.args.get("context_question", "").strip()
+    else:
+        body = request.get_json(force=True, silent=True) or {}
+        query = body.get("query", "").strip()
+        context = body.get("context", "").strip()
+        context_question = body.get("context_question", "").strip()
 
     if not query:
         return jsonify({"error": "query field is required"}), 400
 
     result = summarize_clusters_wrapper(query, context, context_question)
+    if "error" in result:
+        return jsonify(result), 422
+    return jsonify(result), 200
+
+@app.route("/renderhive/<query>/<context>", methods=["GET"])
+def renderhive(query, context):
+    result = summarize_clusters_wrapper(query, context, "")
     if "error" in result:
         return jsonify(result), 422
     return jsonify(result), 200
