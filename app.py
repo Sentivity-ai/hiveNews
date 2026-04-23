@@ -181,13 +181,14 @@ CLUSTER {cid}:
 
 
 # =========================
-# OPTIMIZED: Single batch OpenAI call
+# OPTIMIZED: Single batch OpenAI call with Responses API
 # =========================
 
 async def generate_reports_async(query: str, context_question: str, clusters: Dict, proper_counts: dict) -> Tuple[str, str]:
     """
     OPTIMIZED: Single OpenAI call that generates ALL reports at once.
     Reduces from ~5 API calls to 1 comprehensive call.
+    Uses new Responses API format.
     """
     
     is_question = bool(context_question)
@@ -242,16 +243,24 @@ REQUIREMENTS:
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
-            lambda: client.messages.create(
+            lambda: client.responses.create(
                 model="gpt-4o",
-                max_tokens=2000,
-                messages=[
+                input=[
                     {"role": "user", "content": prompt}
                 ]
             )
         )
         
-        response_text = response.content[0].text
+        # Extract text from Responses API format
+        response_text = response.output_text if hasattr(response, 'output_text') else ""
+        
+        if not response_text:
+            # Fallback: manually extract from output array
+            for item in response.output:
+                for content in item.get('content', []):
+                    if content.get('type') == 'output_text':
+                        response_text = content.get('text', '')
+                        break
         
         # Parse JSON response
         try:
